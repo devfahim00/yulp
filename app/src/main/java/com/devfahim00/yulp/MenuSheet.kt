@@ -49,9 +49,14 @@ object MenuSheet {
         }
         root.addView(handle)
 
-        // pager with the two grid pages
+        // pager with the two grid pages - height sized EXACTLY to the row count
+        // (rows x rowHeight + padding) so there is no dead space below the grid.
+        val rowH = 84 * dp.toInt()
+        val pagePad = 8 * dp.toInt()
+        val rows = ((maxOf(page1.size, page2.size) + 4) / 5).coerceAtLeast(1)
+        val gridH = rows * rowH + 2 * pagePad
         val pager = ViewPager2(activity).apply {
-            layoutParams = LinearLayout.LayoutParams(-1, 210 * dp.toInt())
+            layoutParams = LinearLayout.LayoutParams(-1, gridH)
         }
         val pages = listOf(page1, page2)
         pager.adapter = object : androidx.recyclerview.widget.RecyclerView.Adapter<androidx.recyclerview.widget.RecyclerView.ViewHolder>() {
@@ -119,7 +124,7 @@ object MenuSheet {
             columnCount = 5
             orientation = GridLayout.HORIZONTAL
             setUseDefaultMargins(false)
-            val pad = (10 * activity.resources.displayMetrics.density).toInt()
+            val pad = (8 * activity.resources.displayMetrics.density).toInt()
             setPadding(pad, pad, pad, pad)
         }
 
@@ -127,11 +132,12 @@ object MenuSheet {
         grid.removeAllViews()
         val ctx = grid.context
         val dp = ctx.resources.displayMetrics.density
+        val rowH = (84 * dp).toInt()
         for (it in items) {
             val cell = LinearLayout(ctx).apply {
                 orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER_HORIZONTAL
-                setPadding(0, (8 * dp).toInt(), 0, (8 * dp).toInt())
+                gravity = Gravity.CENTER
+                setPadding(0, 0, 0, 0)
                 isClickable = true
                 setBackgroundResource(R.drawable.bg_ripple)
                 setOnClickListener { _ -> it.action() }
@@ -139,7 +145,7 @@ object MenuSheet {
                     columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
                     rowSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
                     width = 0
-                    height = -2
+                    height = rowH
                     setMargins(2, 4, 2, 4)
                 }
             }

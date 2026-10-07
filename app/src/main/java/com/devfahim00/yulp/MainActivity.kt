@@ -18,7 +18,6 @@ import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
 import android.view.KeyEvent
-import android.view.MotionEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
@@ -43,6 +42,7 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.app.AppCompatDelegate
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -55,7 +55,6 @@ import com.google.android.material.progressindicator.LinearProgressIndicator
 import org.json.JSONObject
 import java.io.File
 import java.io.IOException
-import kotlin.math.abs
 
 class MainActivity : AppCompatActivity() {
 
@@ -93,9 +92,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var findBar: View
     private lateinit var findInput: EditText
     private lateinit var incognitoIcon: ImageButton
-    private lateinit var fabMedia: FrameLayout
-    private lateinit var fabBadge: TextView
     private lateinit var mobileUa: String
+
+    /** WebView renders content dark natively (algorithmic darkening) when supported. */
+    private val algoDark: Boolean by lazy {
+        WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)
+    }
+
     private var fullscreen = false
 
     private var customView: View? = null
@@ -175,6 +178,9 @@ class MainActivity : AppCompatActivity() {
         DownloadEngine.init(this, autoResume = false)
         mobileUa = WebSettings.getDefaultUserAgent(this)
 
+        // first-party cookies must be ON for Google search etc. to work
+        CookieManager.getInstance().setAcceptCookie(true)
+
         container = findViewById(R.id.container)
         urlBar = findViewById(R.id.urlBar)
         progress = findViewById(R.id.progress)
@@ -182,8 +188,6 @@ class MainActivity : AppCompatActivity() {
         findBar = findViewById(R.id.findBar)
         findInput = findViewById(R.id.findInput)
         incognitoIcon = findViewById(R.id.icIncognito)
-        fabMedia = findViewById(R.id.fabMedia)
-        fabBadge = findViewById(R.id.fabMediaBadge)
 
         if (Settings.keepScreenOn) window.addFlags(
             android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
@@ -206,12 +210,6 @@ class MainActivity : AppCompatActivity() {
         findViewById<View>(R.id.findPrev).setOnClickListener { current?.web?.findNext(false) }
         findViewById<View>(R.id.findClose).setOnClickListener { closeFind() }
 
-        setupFab()
-
-        MediaSniffer.addListener { tabId ->
-            runOnUiThread { if (tabId == current?.id) updateFab() }
-        }
-
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 when {
@@ -225,12 +223,50 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
-        newTab(intent?.data?.toString())
+        val restored = restoreTabs(savedInstanceState)
+        if (!restored) newTab(intent?.data?.toString())
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         intent.data?.let { newTab(it.toString()) }
+    }
+
+    /**
+     * Keep tabs across theme toggles (night mode) and process death.
+     * Incognito URLs are deliberately NOT persisted.
+     */
+    private fun restoreTabs(state: Bundle?): Boolean {
+        val saved = state?.getStringArrayList("tabs") ?: return false
+        if (saved.isEmpty()) return false
+        val savedCur = state.getInt("cur", -1)
+        var firstIndex = -1
+        for (entry in saved) {
+            val p = entry.split('\u0000')
+            val url = p.getOrNull(0) ?: continue
+            val incognito = p.getOrNull(1) == "1"
+            val desktop = p.getOrNull(2) == "1"
+            val t = Tab(nextId++, incognito)
+            t.desktop = desktop
+            t.web = makeWebView(t)
+            tabs.add(t)
+            if (firstIndex < 0) firstIndex = tabs.lastIndex
+            if (incognito || url.isBlank() || isHome(url)) loadHome(t.web) else t.web.loadUrl(url)
+        }
+        if (tabs.isEmpty()) return false
+        switchTo(if (savedCur in tabs.indices) savedCur else firstIndex)
+        return true
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        val arr = ArrayList<String>(tabs.size)
+        tabs.forEach { t ->
+            // never persist incognito URLs
+            arr.add("${if (t.incognito) "" else (t.web.url ?: "")}\u0000${if (t.incognito) "1" else "0"}\u0000${if (t.desktop) "1" else "0"}")
+        }
+        outState.putStringArrayList("tabs", arr)
+        outState.putInt("cur", cur)
     }
 
     override fun onPause() { captureThumb(current); current?.web?.onPause(); super.onPause() }
@@ -262,7 +298,6 @@ class MainActivity : AppCompatActivity() {
         progress.visibility = View.INVISIBLE
         updateIncognitoBadge()
         updateTabSnapshot()
-        updateFab()
     }
 
     private fun updateIncognitoBadge() {
@@ -324,9 +359,20 @@ class MainActivity : AppCompatActivity() {
             allowFileAccess = false
             allowContentAccess = false
         }
-        val night = resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES
-        if (night && WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
-            WebSettingsCompat.setAlgorithmicDarkeningAllowed(w.settings, true)
+        // Let the WebView render web content dark together with the app's night
+        // mode (preferred over CSS inversion on modern WebViews).
+        try {
+            if (algoDark) WebSettingsCompat.setAlgorithmicDarkeningAllowed(w.settings, true)
+        } catch (_: Exception) {
+        }
+        // Google serves a "unusual traffic / captcha" page when it sees the
+        // X-Requested-With header on direct SERP loads -> empty allow-list
+        // strips the header entirely (WebView 118+).
+        try {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.REQUESTED_WITH_HEADER_ALLOW_LIST)) {
+                WebSettingsCompat.setRequestedWithHeaderOriginAllowList(w.settings, setOf())
+            }
+        } catch (_: Exception) {
         }
         CookieManager.getInstance().setAcceptThirdPartyCookies(w, !t.incognito)
 
@@ -398,7 +444,6 @@ class MainActivity : AppCompatActivity() {
                     showUrl(url)
                     progress.visibility = View.INVISIBLE
                     captureThumb(t)
-                    updateFab()
                 }
                 if (!t.incognito && url.startsWith("http") && !isHome(url)) {
                     store.addHistory(Store.Item(t.title, url))
@@ -457,7 +502,7 @@ class MainActivity : AppCompatActivity() {
         return w
     }
 
-    // ---------- script injection (cosmetic ad filter + night mode + media sniff) ----------
+    // ---------- script injection (cosmetic ad filter + media sniff + night fallback) ----------
 
     private fun injectScripts(w: WebView) {
         try {
@@ -472,13 +517,17 @@ st.textContent=o.css;(document.head||document.documentElement).appendChild(st);}
                 w.evaluateJavascript(AdBlocker.cosmeticJs(), null)
             }
             w.evaluateJavascript(MediaSniffer.sniffJs(), null)
-            if (Settings.nightMode) applyNight(w, true)
+            // CSS-invert night mode only as a fallback for old WebViews without
+            // algorithmic darkening; never applied to our own start page.
+            if (!algoDark) applyNight(w, Settings.nightMode)
         } catch (_: Exception) {
         }
     }
 
     private fun applyNight(w: WebView, on: Boolean) {
         try {
+            val url = w.url ?: ""
+            if (isHome(url)) return // start page themes itself from Settings
             if (on) {
                 val payload = JSONObject().put("css", NIGHT_CSS).toString()
                 w.evaluateJavascript(
@@ -497,64 +546,21 @@ st.textContent=o.css;(document.head||document.documentElement).appendChild(st);}
         }
     }
 
+    /**
+     * Night mode now applies app-wide: the setting drives the Android theme
+     * (activities re-create with the right palette) and WebView content
+     * (algorithmic darkening on modern WebViews).
+     */
     private fun toggleNight() {
         Settings.nightMode = !Settings.nightMode
-        tabs.forEach { applyNight(it.web, Settings.nightMode) }
+        AppCompatDelegate.setDefaultNightMode(
+            if (Settings.nightMode) AppCompatDelegate.MODE_NIGHT_YES
+            else AppCompatDelegate.MODE_NIGHT_NO
+        )
         toast(if (Settings.nightMode) "Night mode on" else "Night mode off")
     }
 
-    // ---------- floating media button ----------
-
-    private var fabLastX = 0f
-    private var fabLastY = 0f
-    private var fabMoved = false
-
-    @SuppressLint("ClickableViewAccessibility")
-    private fun setupFab() {
-        fabMedia.setOnTouchListener { v, ev ->
-            when (ev.actionMasked) {
-                MotionEvent.ACTION_DOWN -> {
-                    fabLastX = ev.rawX; fabLastY = ev.rawY; fabMoved = false; true
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    val dx = ev.rawX - fabLastX
-                    val dy = ev.rawY - fabLastY
-                    if (abs(dx) > 6 || abs(dy) > 6) fabMoved = true
-                    if (fabMoved) {
-                        v.translationX += dx
-                        v.translationY += dy
-                        clampFab(v)
-                    }
-                    fabLastX = ev.rawX; fabLastY = ev.rawY
-                    true
-                }
-                MotionEvent.ACTION_UP -> {
-                    if (!fabMoved) openMediaPicker()
-                    v.performClick()
-                    true
-                }
-                else -> false
-            }
-        }
-    }
-
-    private fun clampFab(v: View) {
-        val parent = v.parent as? View ?: return
-        val maxX = parent.width - v.width.toFloat()
-        val maxY = parent.height - v.height.toFloat()
-        // base position = bottom|end + margins; translation measured from there
-        v.translationX = v.translationX.coerceIn(-maxX, 0f)
-        v.translationY = v.translationY.coerceIn(-maxY, 0f)
-    }
-
-    private fun updateFab() {
-        val t = current ?: return
-        val url = t.web.url ?: ""
-        val items = MediaSniffer.get(t.id)
-        val show = items.isNotEmpty() && url.startsWith("http") && !isHome(url) && customView == null
-        fabMedia.visibility = if (show) View.VISIBLE else View.GONE
-        if (show) fabBadge.text = if (items.size > 99) "99" else items.size.toString()
-    }
+    // ---------- media picker (via Tools menu; no floating button) ----------
 
     private fun openMediaPicker() {
         val t = current ?: return
@@ -577,7 +583,6 @@ st.textContent=o.css;(document.head||document.documentElement).appendChild(st);}
             systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
             hide(WindowInsetsCompat.Type.systemBars())
         }
-        updateFab()
     }
 
     private fun hideCustom() {
@@ -586,7 +591,6 @@ st.textContent=o.css;(document.head||document.documentElement).appendChild(st);}
         customView = null
         customCb?.onCustomViewHidden(); customCb = null
         WindowInsetsControllerCompat(window, window.decorView).show(WindowInsetsCompat.Type.systemBars())
-        updateFab()
     }
 
     // ---------- navigation helpers ----------
@@ -703,8 +707,11 @@ st.textContent=o.css;(document.head||document.documentElement).appendChild(st);}
     }
 
     private fun showTools() {
+        val t = current
+        val mediaCount = t?.let { MediaSniffer.get(it.id).size } ?: 0
         val items = arrayOf(
             "Find in page", "Translate page", "Save page",
+            if (mediaCount > 0) "Download media ($mediaCount)" else "Download media",
             if (Settings.keepScreenOn) "Keep screen on: ON" else "Keep screen on: OFF",
             "Add to home screen"
         )
@@ -714,7 +721,8 @@ st.textContent=o.css;(document.head||document.documentElement).appendChild(st);}
                     0 -> openFind()
                     1 -> translatePage()
                     2 -> savePage()
-                    3 -> toggleKeepOn()
+                    3 -> openMediaPicker()
+                    4 -> toggleKeepOn()
                     else -> addToHome()
                 }
             }.show()
@@ -739,8 +747,10 @@ st.textContent=o.css;(document.head||document.documentElement).appendChild(st);}
     private fun aboutDialog() {
         AlertDialog.Builder(this).setTitle("Yulp")
             .setMessage(
-                "Yulp browser v1.2.0\n\nBuilt-in features:\n• Extreme ad blocker with history\n" +
-                    "• Multi-thread background downloads\n• Media sniffer with floating download button\n" +
+                "Yulp browser v1.3.0\n\nBuilt-in features:\n" +
+                    "• EXTREME ad blocker (166k domains, EasyList +\n  EasyPrivacy + AdGuard + StevenBlack engine)\n" +
+                    "• Multi-thread background downloads\n" +
+                    "• Media sniffer with quality picker (Tools menu)\n" +
                     "• Incognito tabs, night mode, tools\n\ngithub.com/devfahim00/yulp"
             )
             .setPositiveButton("OK", null).show()
@@ -767,7 +777,7 @@ st.textContent=o.css;(document.head||document.documentElement).appendChild(st);}
         if (!url.startsWith("http") || isHome(url)) { toast("Open a page first"); return }
         try {
             val shortcut = androidx.core.content.pm.ShortcutInfoCompat.Builder(
-                this, "yulp_${abs(url.hashCode())}"
+                this, "yulp_${kotlin.math.abs(url.hashCode())}"
             )
                 .setShortLabel(t.title.ifBlank { "Yulp" }.take(20))
                 .setIcon(androidx.core.graphics.drawable.IconCompat.createWithResource(this, R.mipmap.ic_launcher))
@@ -940,10 +950,16 @@ st.textContent=o.css;(document.head||document.documentElement).appendChild(st);}
         ).joinToString("") {
             "<a class=t href=\"${it.second}\"><b>${it.first.first()}</b><span>${it.first}</span></a>"
         }
+        // Start-page palette follows the app night-mode setting directly (not
+        // prefers-color-scheme) so it always matches the surrounding app UI.
+        val dark = Settings.nightMode
+        val rootVars = if (dark)
+            "--bg:#121316;--fg:#e4e2e6;--card:#23252c;--ac:#9db0ff"
+        else
+            "--bg:#fff;--fg:#1b1b1f;--card:#eceefa;--ac:#4f6bff"
         return """<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
 <style>
-:root{color-scheme:light dark;--bg:#fff;--fg:#1b1b1f;--card:#eceefa;--ac:#4f6bff}
-@media(prefers-color-scheme:dark){:root{--bg:#121316;--fg:#e4e2e6;--card:#23252c;--ac:#9db0ff}}
+:root{color-scheme:${if (dark) "dark" else "light"};$rootVars}
 body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,sans-serif;display:flex;flex-direction:column;align-items:center;padding:12vh 20px 0}
 h1{font-size:44px;margin:0 0 24px;letter-spacing:-1px;color:var(--ac)}
 form{width:100%;max-width:520px}

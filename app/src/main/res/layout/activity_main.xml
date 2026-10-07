@@ -113,38 +113,6 @@
             android:id="@+id/container"
             android:layout_width="match_parent"
             android:layout_height="match_parent" />
-
-        <FrameLayout
-            android:id="@+id/fabMedia"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_gravity="bottom|end"
-            android:layout_margin="16dp"
-            android:background="@drawable/bg_fab"
-            android:contentDescription="Download media"
-            android:elevation="6dp"
-            android:visibility="gone">
-
-            <ImageView
-                android:layout_width="26dp"
-                android:layout_height="26dp"
-                android:layout_gravity="center"
-                android:layout_margin="11dp"
-                android:src="@drawable/ic_media_download" />
-
-            <TextView
-                android:id="@+id/fabMediaBadge"
-                android:layout_width="18dp"
-                android:layout_height="18dp"
-                android:layout_gravity="top|end"
-                android:layout_margin="2dp"
-                android:background="@drawable/bg_badge"
-                android:gravity="center"
-                android:text="1"
-                android:textColor="@color/badgeText"
-                android:textSize="10sp"
-                android:textStyle="bold" />
-        </FrameLayout>
     </FrameLayout>
 
     <LinearLayout

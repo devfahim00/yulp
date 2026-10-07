@@ -24,7 +24,12 @@ class SettingsActivity : AppCompatActivity() {
 
         findViewById<MaterialSwitch>(R.id.swNight).apply {
             isChecked = Settings.nightMode
-            setOnCheckedChangeListener { _, v -> Settings.nightMode = v }
+            setOnCheckedChangeListener { _, v ->
+                Settings.nightMode = v
+                // applies to the whole app (toolbar, pages, dialogs) and
+                // re-creates activities with the right palette
+                YulpApp.applyNightMode()
+            }
         }
         findViewById<MaterialSwitch>(R.id.swKeepOn).apply {
             isChecked = Settings.keepScreenOn
@@ -80,6 +85,6 @@ class SettingsActivity : AppCompatActivity() {
         }
 
         findViewById<TextView>(R.id.txtAbout).text =
-            "Yulp v1.2.0 · github.com/devfahim00/yulp"
+            "Yulp v1.3.0 · github.com/devfahim00/yulp"
     }
 }
