@@ -48,8 +48,12 @@ class DownloadsActivity : AppCompatActivity(), DownloadEngine.Listener {
                     DownloadEngine.fmtSpeed(t.speed).let { if (it.isNotEmpty()) sb.append(" · ").append(it) }
                     sb.append(" · ${DownloadEngine.fmt(t.downloaded)}")
                     if (t.total > 0) sb.append(" / ").append(DownloadEngine.fmt(t.total))
+                    t.hls?.let { sb.append(" · HLS seg ").append(it.segDone).append("/").append(it.segTotal) }
                 }
-                DownloadEngine.Status.PAUSED -> sb.append("Paused · ${DownloadEngine.fmt(t.downloaded)}")
+                DownloadEngine.Status.PAUSED -> {
+                    sb.append("Paused · ${DownloadEngine.fmt(t.downloaded)}")
+                    t.hls?.let { sb.append(" · HLS seg ").append(it.segDone).append("/").append(it.segTotal) }
+                }
                 DownloadEngine.Status.COMPLETED -> sb.append("Done · ${DownloadEngine.fmt(t.downloaded)}")
                 DownloadEngine.Status.FAILED -> sb.append("Failed · ${t.error ?: "error"}")
                 DownloadEngine.Status.QUEUED -> sb.append("Queued")

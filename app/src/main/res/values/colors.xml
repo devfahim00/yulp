@@ -1,1 +1,10 @@
-<resources><color name="ic_bg">#4F6BFF</color></resources>
+<resources>
+    <color name="ic_bg">#4F6BFF</color>
+    <color name="menuSheetBg">#FFFFFF</color>
+    <color name="menuItemIcon">#3A3B42</color>
+    <color name="menuItemText">#5A5B63</color>
+    <color name="dotColor">#4F6BFF</color>
+    <color name="fabBg">#4F6BFF</color>
+    <color name="badgeBg">#FF4D5A</color>
+    <color name="badgeText">#FFFFFF</color>
+</resources>

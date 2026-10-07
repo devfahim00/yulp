@@ -4,6 +4,7 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -14,11 +15,15 @@ import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
 import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
@@ -38,7 +43,6 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
-import androidx.appcompat.widget.PopupMenu
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -48,6 +52,10 @@ import androidx.webkit.WebViewFeature
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.button.MaterialButtonToggleGroup
 import com.google.android.material.progressindicator.LinearProgressIndicator
+import org.json.JSONObject
+import java.io.File
+import java.io.IOException
+import kotlin.math.abs
 
 class MainActivity : AppCompatActivity() {
 
@@ -57,9 +65,20 @@ class MainActivity : AppCompatActivity() {
         var desktop = false
     }
 
+    /** JS bridge: receives media scan reports from pages. */
+    private class MediaBridge(val tabId: Int) {
+        @JavascriptInterface
+        fun report(json: String) {
+            MediaSniffer.parseReport(tabId, json)
+        }
+    }
+
     private companion object {
         const val HOME = "https://yulp.start/"
         var nextId = 1
+        const val NIGHT_CSS =
+            "html{filter:invert(1) hue-rotate(180deg)!important;background:#fff!important}" +
+                "img,video,picture,canvas,svg,iframe,embed,object{filter:invert(1) hue-rotate(180deg)!important}"
     }
 
     private val tabs = mutableListOf<Tab>()
@@ -74,7 +93,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var findBar: View
     private lateinit var findInput: EditText
     private lateinit var incognitoIcon: ImageButton
+    private lateinit var fabMedia: FrameLayout
+    private lateinit var fabBadge: TextView
     private lateinit var mobileUa: String
+    private var fullscreen = false
 
     private var customView: View? = null
     private var customCb: WebChromeClient.CustomViewCallback? = null
@@ -111,6 +133,7 @@ class MainActivity : AppCompatActivity() {
                         val t = tabs.removeAt(i)
                         t.web.destroy()
                         Tabs.thumbnails.remove(id)
+                        MediaSniffer.clear(id)
                     }
                 }
                 cur = -1
@@ -147,6 +170,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
         store = Store(this)
+        Settings.init(this)
         AdBlocker.init(this)
         DownloadEngine.init(this, autoResume = false)
         mobileUa = WebSettings.getDefaultUserAgent(this)
@@ -158,6 +182,12 @@ class MainActivity : AppCompatActivity() {
         findBar = findViewById(R.id.findBar)
         findInput = findViewById(R.id.findInput)
         incognitoIcon = findViewById(R.id.icIncognito)
+        fabMedia = findViewById(R.id.fabMedia)
+        fabBadge = findViewById(R.id.fabMediaBadge)
+
+        if (Settings.keepScreenOn) window.addFlags(
+            android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+        )
 
         urlBar.setOnEditorActionListener { v, actionId, e ->
             if (actionId == EditorInfo.IME_ACTION_GO || e?.keyCode == KeyEvent.KEYCODE_ENTER) {
@@ -169,17 +199,24 @@ class MainActivity : AppCompatActivity() {
         findViewById<View>(R.id.btnForward).setOnClickListener { current?.web?.let { if (it.canGoForward()) it.goForward() } }
         findViewById<View>(R.id.btnHome).setOnClickListener { current?.web?.let { loadHome(it) } }
         findViewById<View>(R.id.btnTabs).setOnClickListener { openTabGrid() }
-        findViewById<View>(R.id.btnMenu).setOnClickListener { showMenu(it) }
+        findViewById<View>(R.id.btnMenu).setOnClickListener { showMenu() }
 
         findInput.doAfterTextChanged { current?.web?.findAllAsync(it.toString()) }
         findViewById<View>(R.id.findNext).setOnClickListener { current?.web?.findNext(true) }
         findViewById<View>(R.id.findPrev).setOnClickListener { current?.web?.findNext(false) }
         findViewById<View>(R.id.findClose).setOnClickListener { closeFind() }
 
+        setupFab()
+
+        MediaSniffer.addListener { tabId ->
+            runOnUiThread { if (tabId == current?.id) updateFab() }
+        }
+
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 when {
                     customView != null -> hideCustom()
+                    fullscreen -> toggleFullscreen()
                     findBar.visibility == View.VISIBLE -> closeFind()
                     current?.web?.canGoBack() == true -> current?.web?.goBack()
                     tabs.size > 1 -> closeTab(cur)
@@ -225,6 +262,7 @@ class MainActivity : AppCompatActivity() {
         progress.visibility = View.INVISIBLE
         updateIncognitoBadge()
         updateTabSnapshot()
+        updateFab()
     }
 
     private fun updateIncognitoBadge() {
@@ -258,6 +296,7 @@ class MainActivity : AppCompatActivity() {
     private fun closeTab(i: Int) {
         val t = tabs.removeAt(i)
         Tabs.thumbnails.remove(t.id)
+        MediaSniffer.clear(t.id)
         container.removeView(t.web)
         t.web.destroy()
         cur = -1
@@ -272,7 +311,7 @@ class MainActivity : AppCompatActivity() {
 
     // ---------- webview ----------
 
-    @SuppressLint("SetJavaScriptEnabled")
+    @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
     private fun makeWebView(t: Tab): WebView {
         val w = WebView(this)
         w.settings.apply {
@@ -292,6 +331,7 @@ class MainActivity : AppCompatActivity() {
         CookieManager.getInstance().setAcceptThirdPartyCookies(w, !t.incognito)
 
         w.setDownloadListener { url, ua, cd, mime, _ -> download(url, ua, cd, mime) }
+        w.addJavascriptInterface(MediaBridge(t.id), "YulpMedia")
 
         w.setOnLongClickListener {
             val r = w.hitTestResult
@@ -327,13 +367,29 @@ class MainActivity : AppCompatActivity() {
                 if (rule != null) {
                     // ads are blocked in incognito too, but nothing is recorded
                     if (!t.incognito) AdBlocker.record(u, rule)
-                    return AdBlocker.emptyResponse()
+                    // Failing stream -> the request dies with a network error,
+                    // exactly like uBlock's ERR_BLOCKED_BY_CLIENT.
+                    return AdBlocker.blockedResponse()
+                }
+                // media sniffing (video/audio found via network requests)
+                try {
+                    val type = MediaSniffer.sniffUrl(u)
+                    if (type != null) {
+                        val label = if ("videoplayback" in u || "googlevideo" in u)
+                            MediaSniffer.itagLabel(u) else ""
+                        MediaSniffer.put(t.id, MediaSniffer.Media(u, type, label, src = "net"))
+                    }
+                } catch (_: Exception) {
                 }
                 return null
             }
 
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
                 if (t === current) { showUrl(url); progress.visibility = View.VISIBLE }
+                if (url.startsWith("http") && !isHome(url)) {
+                    MediaSniffer.clear(t.id)
+                    injectScripts(view)
+                }
             }
 
             override fun onPageFinished(view: WebView, url: String) {
@@ -342,10 +398,12 @@ class MainActivity : AppCompatActivity() {
                     showUrl(url)
                     progress.visibility = View.INVISIBLE
                     captureThumb(t)
+                    updateFab()
                 }
                 if (!t.incognito && url.startsWith("http") && !isHome(url)) {
                     store.addHistory(Store.Item(t.title, url))
                 }
+                injectScripts(view)
                 updateTabSnapshot()
             }
 
@@ -399,6 +457,117 @@ class MainActivity : AppCompatActivity() {
         return w
     }
 
+    // ---------- script injection (cosmetic ad filter + night mode + media sniff) ----------
+
+    private fun injectScripts(w: WebView) {
+        try {
+            if (AdBlocker.enabled) {
+                val payload = JSONObject().put("css", AdBlocker.cosmeticSelectors()).toString()
+                w.evaluateJavascript(
+                    """!function(){try{if(document.getElementById('yulp-cosmetic'))return;
+var o=$payload;var st=document.createElement('style');st.id='yulp-cosmetic';
+st.textContent=o.css;(document.head||document.documentElement).appendChild(st);}catch(e){}}();""",
+                    null
+                )
+                w.evaluateJavascript(AdBlocker.cosmeticJs(), null)
+            }
+            w.evaluateJavascript(MediaSniffer.sniffJs(), null)
+            if (Settings.nightMode) applyNight(w, true)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun applyNight(w: WebView, on: Boolean) {
+        try {
+            if (on) {
+                val payload = JSONObject().put("css", NIGHT_CSS).toString()
+                w.evaluateJavascript(
+                    """!function(){try{if(document.getElementById('yulp-night'))return;
+var o=$payload;var st=document.createElement('style');st.id='yulp-night';
+st.textContent=o.css;(document.head||document.documentElement).appendChild(st);}catch(e){}}();""",
+                    null
+                )
+            } else {
+                w.evaluateJavascript(
+                    """!function(){try{var s=document.getElementById('yulp-night');if(s)s.remove();}catch(e){}}();""",
+                    null
+                )
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun toggleNight() {
+        Settings.nightMode = !Settings.nightMode
+        tabs.forEach { applyNight(it.web, Settings.nightMode) }
+        toast(if (Settings.nightMode) "Night mode on" else "Night mode off")
+    }
+
+    // ---------- floating media button ----------
+
+    private var fabLastX = 0f
+    private var fabLastY = 0f
+    private var fabMoved = false
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun setupFab() {
+        fabMedia.setOnTouchListener { v, ev ->
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    fabLastX = ev.rawX; fabLastY = ev.rawY; fabMoved = false; true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = ev.rawX - fabLastX
+                    val dy = ev.rawY - fabLastY
+                    if (abs(dx) > 6 || abs(dy) > 6) fabMoved = true
+                    if (fabMoved) {
+                        v.translationX += dx
+                        v.translationY += dy
+                        clampFab(v)
+                    }
+                    fabLastX = ev.rawX; fabLastY = ev.rawY
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (!fabMoved) openMediaPicker()
+                    v.performClick()
+                    true
+                }
+                else -> false
+            }
+        }
+    }
+
+    private fun clampFab(v: View) {
+        val parent = v.parent as? View ?: return
+        val maxX = parent.width - v.width.toFloat()
+        val maxY = parent.height - v.height.toFloat()
+        // base position = bottom|end + margins; translation measured from there
+        v.translationX = v.translationX.coerceIn(-maxX, 0f)
+        v.translationY = v.translationY.coerceIn(-maxY, 0f)
+    }
+
+    private fun updateFab() {
+        val t = current ?: return
+        val url = t.web.url ?: ""
+        val items = MediaSniffer.get(t.id)
+        val show = items.isNotEmpty() && url.startsWith("http") && !isHome(url) && customView == null
+        fabMedia.visibility = if (show) View.VISIBLE else View.GONE
+        if (show) fabBadge.text = if (items.size > 99) "99" else items.size.toString()
+    }
+
+    private fun openMediaPicker() {
+        val t = current ?: return
+        val url = t.web.url ?: ""
+        if (!url.startsWith("http") || isHome(url)) { toast("Open a page first"); return }
+        startActivity(
+            Intent(this, MediaPickerActivity::class.java)
+                .putExtra("tabId", t.id)
+                .putExtra("pageUrl", url)
+                .putExtra("ua", mobileUa)
+        )
+    }
+
     private fun showCustom(v: View, cb: WebChromeClient.CustomViewCallback) {
         if (customView != null) { cb.onCustomViewHidden(); return }
         v.setBackgroundColor(Color.BLACK)
@@ -408,6 +577,7 @@ class MainActivity : AppCompatActivity() {
             systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
             hide(WindowInsetsCompat.Type.systemBars())
         }
+        updateFab()
     }
 
     private fun hideCustom() {
@@ -416,6 +586,7 @@ class MainActivity : AppCompatActivity() {
         customView = null
         customCb?.onCustomViewHidden(); customCb = null
         WindowInsetsControllerCompat(window, window.decorView).show(WindowInsetsCompat.Type.systemBars())
+        updateFab()
     }
 
     // ---------- navigation helpers ----------
@@ -430,7 +601,7 @@ class MainActivity : AppCompatActivity() {
         val t = s.trim()
         return when {
             t.startsWith("http://") || t.startsWith("https://") -> t
-            t.contains(" ") || !t.contains(".") -> "https://www.google.com/search?q=" + Uri.encode(t)
+            t.contains(" ") || !t.contains(".") -> Settings.searchUrl(t)
             else -> "https://$t"
         }
     }
@@ -474,46 +645,209 @@ class MainActivity : AppCompatActivity() {
         hideKb(findInput)
     }
 
-    // ---------- menu ----------
+    // ---------- Via-style bottom sheet menu ----------
 
-    private fun showMenu(anchor: View) {
+    private fun showMenu() {
         val t = current ?: return
         val url = t.web.url ?: ""
-        val m = PopupMenu(this, anchor)
-        m.menu.apply {
-            add(0, 1, 0, "New tab")
-            add(0, 2, 0, "New incognito tab")
-            add(0, 3, 0, "Close tab")
-            add(0, 4, 0, if (store.isBookmarked(url)) "Remove bookmark" else "Add bookmark")
-            add(0, 5, 0, "Bookmarks")
-            add(0, 6, 0, "History")
-            add(0, 7, 0, "Downloads")
-            add(0, 8, 0, "Ad blocker")
-            add(0, 12, 0, "Find in page")
-            add(0, 9, 0, "Desktop site").apply { isCheckable = true; isChecked = t.desktop }
-            add(0, 10, 0, "Share")
-            add(0, 11, 0, "Clear browsing data")
-        }
-        m.setOnMenuItemClickListener {
-            when (it.itemId) {
-                1 -> newTab()
-                2 -> newTab(null, true)
-                3 -> closeTab(cur)
-                4 -> if (url.startsWith("http") && !isHome(url))
+
+        val page1 = listOf(
+            MenuSheet.Item("Night mode", R.drawable.ic_night) { toggleNight() },
+            MenuSheet.Item("Bookmarks", R.drawable.ic_bookmark) {
+                listLauncher.launch(Intent(this, ListPageActivity::class.java).putExtra("mode", "bookmarks"))
+            },
+            MenuSheet.Item("History", R.drawable.ic_history) {
+                listLauncher.launch(Intent(this, ListPageActivity::class.java).putExtra("mode", "history"))
+            },
+            MenuSheet.Item("Downloads", R.drawable.ic_download) {
+                startActivity(Intent(this, DownloadsActivity::class.java))
+            },
+            MenuSheet.Item("Incognito mode", R.drawable.ic_incognito) { newTab(null, true) },
+            MenuSheet.Item("Share", R.drawable.ic_share) {
+                if (url.startsWith("http") && !isHome(url)) share(url) else toast("Nothing to share")
+            },
+            MenuSheet.Item(
+                if (store.isBookmarked(url)) "Remove bookmark" else "Add bookmark",
+                R.drawable.ic_add_bookmark
+            ) {
+                if (url.startsWith("http") && !isHome(url))
                     toast(if (store.toggleBookmark(Store.Item(t.title, url))) "Bookmarked" else "Bookmark removed")
                 else toast("Open a page first")
-                5 -> listLauncher.launch(Intent(this, ListPageActivity::class.java).putExtra("mode", "bookmarks"))
-                6 -> listLauncher.launch(Intent(this, ListPageActivity::class.java).putExtra("mode", "history"))
-                7 -> startActivity(Intent(this, DownloadsActivity::class.java))
-                8 -> startActivity(Intent(this, AdBlockActivity::class.java))
-                12 -> openFind()
-                9 -> setDesktop(t, !t.desktop)
-                10 -> if (url.startsWith("http")) share(url) else toast("Nothing to share")
-                11 -> clearData()
+            },
+            MenuSheet.Item("Desktop site", R.drawable.ic_desktop) { setDesktop(t, !t.desktop) },
+            MenuSheet.Item("Tools", R.drawable.ic_tools) { showTools() },
+            MenuSheet.Item("Settings", R.drawable.ic_settings) {
+                startActivity(Intent(this, SettingsActivity::class.java))
             }
-            true
+        )
+
+        val page2 = listOf(
+            MenuSheet.Item("Ad blocker", R.drawable.ic_shield) {
+                startActivity(Intent(this, AdBlockActivity::class.java))
+            },
+            MenuSheet.Item("Find in page", R.drawable.ic_find) { openFind() },
+            MenuSheet.Item("Save page", R.drawable.ic_save) { savePage() },
+            MenuSheet.Item("Translate", R.drawable.ic_translate) { translatePage() },
+            MenuSheet.Item("Clear data", R.drawable.ic_clear) { clearData() },
+            MenuSheet.Item("New tab", R.drawable.ic_newtab) { newTab() },
+            MenuSheet.Item("Close tab", R.drawable.ic_close) { closeTab(cur) },
+            MenuSheet.Item("Screenshot", R.drawable.ic_screenshot) { screenshot() },
+            MenuSheet.Item("Fullscreen", R.drawable.ic_fullscreen) { toggleFullscreen() },
+            MenuSheet.Item("About", R.drawable.ic_info) { aboutDialog() }
+        )
+
+        MenuSheet.show(this, page1, page2) {
+            toast("Goodbye")
+            finishAffinity()
         }
-        m.show()
+    }
+
+    private fun showTools() {
+        val items = arrayOf(
+            "Find in page", "Translate page", "Save page",
+            if (Settings.keepScreenOn) "Keep screen on: ON" else "Keep screen on: OFF",
+            "Add to home screen"
+        )
+        AlertDialog.Builder(this).setTitle("Tools")
+            .setItems(items) { _, i ->
+                when (i) {
+                    0 -> openFind()
+                    1 -> translatePage()
+                    2 -> savePage()
+                    3 -> toggleKeepOn()
+                    else -> addToHome()
+                }
+            }.show()
+    }
+
+    private fun toggleKeepOn() {
+        Settings.keepScreenOn = !Settings.keepScreenOn
+        if (Settings.keepScreenOn) window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        toast(if (Settings.keepScreenOn) "Keep screen on" else "Keep screen off")
+    }
+
+    private fun toggleFullscreen() {
+        fullscreen = !fullscreen
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            if (fullscreen) hide(WindowInsetsCompat.Type.systemBars())
+            else show(WindowInsetsCompat.Type.systemBars())
+        }
+    }
+
+    private fun aboutDialog() {
+        AlertDialog.Builder(this).setTitle("Yulp")
+            .setMessage(
+                "Yulp browser v1.2.0\n\nBuilt-in features:\n• Extreme ad blocker with history\n" +
+                    "• Multi-thread background downloads\n• Media sniffer with floating download button\n" +
+                    "• Incognito tabs, night mode, tools\n\ngithub.com/devfahim00/yulp"
+            )
+            .setPositiveButton("OK", null).show()
+    }
+
+    private fun translatePage() {
+        val t = current ?: return
+        val u = t.web.url ?: return
+        if (!u.startsWith("http") || isHome(u)) { toast("Open a page first"); return }
+        try {
+            val p = Uri.parse(u)
+            val host = p.host ?: return
+            val link = "https://" + host.replace(".", "-") + ".translate.goog" +
+                (p.path ?: "") + "?_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en&_x_tr_pto=wapp"
+            current?.web?.loadUrl(link)
+        } catch (_: Exception) {
+            toast("Cannot translate this page")
+        }
+    }
+
+    private fun addToHome() {
+        val t = current ?: return
+        val url = t.web.url ?: return
+        if (!url.startsWith("http") || isHome(url)) { toast("Open a page first"); return }
+        try {
+            val shortcut = androidx.core.content.pm.ShortcutInfoCompat.Builder(
+                this, "yulp_${abs(url.hashCode())}"
+            )
+                .setShortLabel(t.title.ifBlank { "Yulp" }.take(20))
+                .setIcon(androidx.core.graphics.drawable.IconCompat.createWithResource(this, R.mipmap.ic_launcher))
+                .setIntent(Intent(Intent.ACTION_VIEW, Uri.parse(url)).setPackage(packageName))
+                .build()
+            if (androidx.core.content.pm.ShortcutManagerCompat.isRequestPinShortcutSupported(this)) {
+                androidx.core.content.pm.ShortcutManagerCompat.requestPinShortcut(this, shortcut, null)
+            } else toast("Not supported by this launcher")
+        } catch (_: Exception) {
+            toast("Cannot add shortcut")
+        }
+    }
+
+    /** Save the current page as a single-file web archive into Downloads. */
+    private fun savePage() {
+        val t = current ?: return
+        val w = t.web
+        val url = w.url ?: ""
+        if (!url.startsWith("http") || isHome(url)) { toast("Open a page first"); return }
+        val base = (t.title.ifBlank { "page" }).replace(Regex("[\\\\/:*?\"<>|]"), "_").take(60)
+        val name = "$base.mht"
+        toast("Saving $name …")
+        Thread {
+            try {
+                val tmp = File(cacheDir, "arch_${System.currentTimeMillis()}.mht")
+                w.saveWebArchive(tmp.absolutePath)
+                val cv = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, name)
+                    put(MediaStore.Downloads.MIME_TYPE, "multipart/related")
+                    put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }
+                val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)
+                    ?: throw IOException("Cannot create file")
+                contentResolver.openOutputStream(uri)?.use { out ->
+                    tmp.inputStream().use { it.copyTo(out) }
+                } ?: throw IOException("Cannot write file")
+                contentResolver.update(uri, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null)
+                tmp.delete()
+                runOnUiThread { toast("Saved $name to Downloads") }
+            } catch (e: Exception) {
+                runOnUiThread { toast("Save failed: ${e.message}") }
+            }
+        }.start()
+    }
+
+    /** Screenshot of the current page into Pictures. */
+    private fun screenshot() {
+        val t = current ?: return
+        val w = t.web
+        if (w.width <= 0 || w.height <= 0) { toast("Nothing to capture"); return }
+        try {
+            val bmp = Bitmap.createBitmap(w.width, w.height, Bitmap.Config.ARGB_8888)
+            val c = Canvas(bmp)
+            c.drawColor(Color.WHITE)
+            w.draw(c)
+            Thread {
+                try {
+                    val cv = ContentValues().apply {
+                        put(MediaStore.Images.Media.DISPLAY_NAME, "yulp_${System.currentTimeMillis()}.png")
+                        put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                        put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES)
+                        put(MediaStore.Images.Media.IS_PENDING, 1)
+                    }
+                    val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
+                        ?: throw IOException("Cannot create file")
+                    contentResolver.openOutputStream(uri)?.use { out ->
+                        bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
+                    }
+                    contentResolver.update(uri, ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }, null, null)
+                    runOnUiThread { toast("Screenshot saved to Pictures") }
+                } catch (e: Exception) {
+                    runOnUiThread { toast("Screenshot failed") }
+                } finally {
+                    bmp.recycle()
+                }
+            }.start()
+        } catch (_: Exception) {
+            toast("Screenshot failed")
+        }
     }
 
     private fun setDesktop(t: Tab, on: Boolean) {
@@ -593,6 +927,11 @@ class MainActivity : AppCompatActivity() {
 <body><h2>Can't reach this page</h2><p>$msg</p></body></html>"""
 
     private fun homeHtml(): String {
+        val searchAction = when (Settings.searchEngine) {
+            "bing" -> "https://www.bing.com/search"
+            "duckduckgo" -> "https://duckduckgo.com/"
+            else -> "https://www.google.com/search"
+        }
         val tiles = listOf(
             "Google" to "https://www.google.com", "YouTube" to "https://m.youtube.com",
             "Wikipedia" to "https://www.wikipedia.org", "GitHub" to "https://github.com",
@@ -613,7 +952,7 @@ input{width:100%;box-sizing:border-box;border:0;border-radius:28px;background:va
 .t{display:flex;flex-direction:column;align-items:center;text-decoration:none;color:var(--fg);font-size:12px}
 .t b{width:52px;height:52px;border-radius:16px;background:var(--card);display:flex;align-items:center;justify-content:center;font-size:22px;color:var(--ac);margin-bottom:6px}
 </style></head><body><h1>Yulp</h1>
-<form action="https://www.google.com/search"><input name=q placeholder="Search the web" autocomplete=off></form>
+<form action="$searchAction"><input name=q placeholder="Search the web" autocomplete=off></form>
 <div class=g>$tiles</div></body></html>"""
     }
 }

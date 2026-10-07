@@ -1,0 +1,9 @@
+<resources>
+    <color name="menuSheetBg">#1E1F24</color>
+    <color name="menuItemIcon">#C9CBD4</color>
+    <color name="menuItemText">#9FA2AC</color>
+    <color name="dotColor">#9DB0FF</color>
+    <color name="fabBg">#4F6BFF</color>
+    <color name="badgeBg">#FF4D5A</color>
+    <color name="badgeText">#FFFFFF</color>
+</resources>

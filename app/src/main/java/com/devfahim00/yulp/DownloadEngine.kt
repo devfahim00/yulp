@@ -24,6 +24,9 @@ import java.util.concurrent.Future
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
+import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 /**
  * Built-in multi-thread download engine.
@@ -40,6 +43,16 @@ import java.util.concurrent.atomic.AtomicLong
 object DownloadEngine {
 
     enum class Status { QUEUED, RUNNING, PAUSED, COMPLETED, FAILED }
+
+    /** HLS (m3u8) state for a task. */
+    class HlsInfo(
+        @Volatile var variantUrl: String = "",
+        @Volatile var segDone: Int = 0,
+        @Volatile var segTotal: Int = 0,
+        var keyUrl: String = "",
+        var keyIvHex: String = "",
+        var initUrl: String = ""
+    )
 
     class Part(val start: Long, @Volatile var end: Long) { // end inclusive; end<0 => open-ended single stream
         @Volatile var downloaded = 0L
@@ -67,6 +80,7 @@ object DownloadEngine {
         var finishedAt = 0L
         val futures = mutableListOf<Future<*>>()
         @Volatile var lastTickBytes = 0L
+        var hls: HlsInfo? = null
 
         fun progressPct(): Int =
             if (total > 0) ((downloaded.coerceAtMost(total)) * 100 / total).toInt() else 0
@@ -134,7 +148,8 @@ object DownloadEngine {
 
     fun enqueue(
         url: String, suggestedName: String?, mime: String?,
-        headers: Map<String, String> = emptyMap(), threads: Int = defaultThreads
+        headers: Map<String, String> = emptyMap(), threads: Int = defaultThreads,
+        hls: Boolean = false
     ): Task {
         var name = suggestedName?.takeIf { it.isNotBlank() }
             ?: URLUtil.guessFileName(url, null, mime) ?: "download"
@@ -142,6 +157,7 @@ object DownloadEngine {
         val m = mime?.takeIf { it.isNotBlank() } ?: "application/octet-stream"
 
         val t = Task(idGen.incrementAndGet(), url, name, m, headers, threads.coerceIn(1, 16))
+        if (hls || url.substringBefore('?').endsWith(".m3u8")) t.hls = HlsInfo()
         synchronized(tasks) { tasks.add(0, t) }
 
         // create the target row in MediaStore Downloads (must be off the main thread)
@@ -199,6 +215,7 @@ object DownloadEngine {
             return
         }
         t.status = Status.RUNNING
+        if (t.hls != null) { startDownload(t); persist(); return }
         if (t.parts.isEmpty()) startDownload(t)
         else {
             // drop fully finished parts; resubmit the rest
@@ -343,6 +360,7 @@ object DownloadEngine {
 
     /** Probe size + range support, split parts, spawn workers. Runs on exec/io thread. */
     private fun startDownload(t: Task) {
+        if (t.hls != null) { hlsStart(t); return }
         exec.execute {
             try {
                 // probe with a 1-byte range request
@@ -485,6 +503,226 @@ object DownloadEngine {
     private fun allDone(t: Task): Boolean =
         synchronized(t.parts) { t.parts.all { it.done() } }
 
+    // ---------------------------------------------------------------- HLS engine
+
+    /** Fetch text with task headers (playlists / keys). */
+    private fun hlsFetchText(t: Task, url: String): String? {
+        return try {
+            val c = openConnection(t)
+            if (c.responseCode !in 200..399) null
+            else c.inputStream.bufferedReader().use { it.readText() }.also { c.disconnect() }
+        } catch (_: Exception) { null }
+    }
+
+    private fun hlsFetchBytes(t: Task, url: String): ByteArray? {
+        return try {
+            val c = openConnection(t)
+            if (c.responseCode !in 200..399) null
+            else c.inputStream.use { it.readBytes() }.also { c.disconnect() }
+        } catch (_: Exception) { null }
+    }
+
+    private fun hlsResolve(base: String, uri: String): String = try {
+        java.net.URI(base).resolve(uri).toString()
+    } catch (_: Exception) { uri }
+
+    /** Parse a master playlist -> variant list (url, bandwidth, w, h). */
+    private fun hlsParseVariants(text: String, base: String): List<Array<Any>> {
+        val out = mutableListOf<Array<Any>>()
+        val lines = text.lines()
+        var i = 0
+        while (i < lines.size) {
+            val l = lines[i].trim()
+            if (l.startsWith("#EXT-X-STREAM-INF")) {
+                val bw = Regex("BANDWIDTH=(\\d+)").find(l)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                val res = Regex("RESOLUTION=(\\d+)x(\\d+)").find(l)?.groupValues
+                var j = i + 1
+                while (j < lines.size && (lines[j].isBlank() || lines[j].startsWith("#"))) j++
+                if (j < lines.size) {
+                    out.add(arrayOf(hlsResolve(base, lines[j].trim()), bw,
+                        (res?.get(1)?.toIntOrNull() ?: 0), (res?.get(2)?.toIntOrNull() ?: 0)))
+                    i = j
+                }
+            }
+            i++
+        }
+        return out
+    }
+
+    /**
+     * HLS pipeline: fetch playlist (master -> best variant), then download
+     * segments with N parallel workers while a writer thread appends them in
+     * order to the target file. AES-128 encrypted streams are decrypted.
+     */
+    private fun hlsStart(t: Task) {
+        exec.execute {
+            try {
+                var plUrl = t.url
+                var text = hlsFetchText(t, plUrl) ?: throw IOException("Cannot fetch playlist")
+                if (text.contains("#EXT-X-STREAM-INF")) {
+                    val best = hlsParseVariants(text, plUrl).maxByOrNull { (it[1] as Long) }
+                    if (best != null) plUrl = best[0] as String
+                    t.hls?.variantUrl = plUrl
+                    text = hlsFetchText(t, plUrl) ?: throw IOException("Cannot fetch variant playlist")
+                } else {
+                    t.hls?.variantUrl = plUrl
+                }
+
+                val lines = text.lines()
+                val segs = mutableListOf<String>()
+                var keyUrl = ""
+                var keyIv = ""
+                var initUrl = ""
+                var i = 0
+                while (i < lines.size) {
+                    val l = lines[i].trim()
+                    when {
+                        l.startsWith("#EXT-X-KEY") -> {
+                            keyUrl = Regex("URI=\"([^\"]+)\"").find(l)?.groupValues?.get(1)
+                                ?.let { hlsResolve(plUrl, it) } ?: ""
+                            keyIv = Regex("IV=0[xX]([0-9a-fA-F]+)").find(l)?.groupValues?.get(1) ?: ""
+                        }
+                        l.startsWith("#EXT-X-MAP") -> {
+                            initUrl = Regex("URI=\"([^\"]+)\"").find(l)?.groupValues?.get(1)
+                                ?.let { hlsResolve(plUrl, it) } ?: ""
+                        }
+                        l.startsWith("#EXTINF") -> {
+                            var j = i + 1
+                            while (j < lines.size && (lines[j].isBlank() || lines[j].startsWith("#"))) j++
+                            if (j < lines.size) segs.add(hlsResolve(plUrl, lines[j].trim()))
+                        }
+                    }
+                    i++
+                }
+                if (segs.isEmpty()) throw IOException("No segments in playlist")
+
+                val skip = (t.hls?.segDone ?: 0).coerceIn(0, segs.size)
+                t.hls?.segTotal = segs.size
+                t.hls?.keyUrl = keyUrl
+                t.hls?.keyIvHex = keyIv
+                t.hls?.initUrl = initUrl
+                val key: ByteArray? = if (keyUrl.isNotEmpty()) hlsFetchBytes(t, keyUrl) else null
+                val remain = segs.subList(skip, segs.size)
+                t.total = -1
+                notifyListeners()
+                if (remain.isEmpty()) { finalize(t, true); return@execute }
+
+                val pending = java.util.concurrent.ConcurrentHashMap<Int, ByteArray>()
+                val nextIdx = java.util.concurrent.atomic.AtomicInteger(0)
+                val uri = t.uri ?: throw IOException("No target file")
+
+                // ordered writer
+                t.futures.add(exec.submit {
+                    try {
+                        val pfd = appCtx.contentResolver.openFileDescriptor(uri, "rw")
+                            ?: throw IOException("Cannot open file")
+                        val ch = java.io.FileOutputStream(pfd.fileDescriptor).channel
+                        var offset = 0L
+                        try {
+                            // fMP4 init segment first
+                            if (skip == 0 && initUrl.isNotEmpty()) {
+                                val init = hlsFetchBytes(t, initUrl)
+                                if (init != null) { ch.write(java.nio.ByteBuffer.wrap(init)); offset += init.size }
+                            }
+                            for (k in remain.indices) {
+                                var data: ByteArray? = null
+                                while (data == null && t.status == Status.RUNNING) {
+                                    data = pending.remove(k)
+                                    if (data == null) try { Thread.sleep(50) } catch (_: InterruptedException) { return@submit }
+                                }
+                                if (data == null) return@submit // paused/failed
+                                ch.position(ch.size())
+                                ch.write(java.nio.ByteBuffer.wrap(data))
+                                offset += data.size
+                                t.downloaded += data.size
+                                t.hls?.segDone = skip + k + 1
+                            }
+                            ch.force(true)
+                            if (t.status == Status.RUNNING) finalize(t, true)
+                        } finally {
+                            try { ch.close() } catch (_: Exception) {}
+                            try { pfd.close() } catch (_: Exception) {}
+                        }
+                    } catch (e: Exception) {
+                        if (t.status == Status.RUNNING) {
+                            t.status = Status.FAILED; t.error = e.message ?: "HLS write failed"
+                            persist(); notifyListeners(); ensureServiceStop()
+                        }
+                    }
+                })
+
+                // parallel segment workers
+                val n = t.threads.coerceIn(1, 6)
+                repeat(n) {
+                    t.futures.add(exec.submit {
+                        while (t.status == Status.RUNNING) {
+                            val idx = nextIdx.getAndIncrement()
+                            if (idx >= remain.size) return@submit
+                            while (pending.size >= n * 2 + 2 && t.status == Status.RUNNING) {
+                                try { Thread.sleep(50) } catch (_: InterruptedException) { return@submit }
+                            }
+                            if (t.status != Status.RUNNING) return@submit
+                            val segUrl = remain[idx]
+                            var data: ByteArray? = null
+                            var err: Exception? = null
+                            for (attempt in 1..4) {
+                                if (t.status != Status.RUNNING) return@submit
+                                try {
+                                    val got = hlsFetchBytes(t, segUrl)
+                                    if (got != null && got.isNotEmpty()) { data = got; break }
+                                    err = IOException("Empty segment")
+                                } catch (e: InterruptedException) { return@submit
+                                } catch (e: Exception) { err = e }
+                                try { Thread.sleep(700L * attempt) } catch (_: InterruptedException) { return@submit }
+                            }
+                            if (data == null || data!!.isEmpty()) {
+                                if (t.status == Status.RUNNING) {
+                                    t.status = Status.FAILED
+                                    t.error = "Segment failed: ${err?.message ?: segUrl.takeLast(60)}"
+                                    persist(); notifyListeners(); ensureServiceStop()
+                                }
+                                return@submit
+                            }
+                            var seg = data!!
+                            // AES-128 decryption
+                            if (key != null && key.size == 16) {
+                                try {
+                                    val iv = if (keyIv.length == 32) hexBytes(keyIv)
+                                    else java.nio.ByteBuffer.allocate(16).apply {
+                                        putLong(0); putLong((skip + idx).toLong())
+                                    }.array()
+                                    val c = Cipher.getInstance("AES/CBC/NoPadding")
+                                    c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+                                    seg = c.doFinal(seg)
+                                } catch (e: Exception) {
+                                    // keep raw segment if decryption fails
+                                }
+                            }
+                            pending[idx] = seg
+                        }
+                    })
+                }
+            } catch (e: Exception) {
+                if (t.isActive()) {
+                    t.status = Status.FAILED
+                    t.error = e.message ?: "HLS failed"
+                    persist()
+                    notifyListeners()
+                    ensureServiceStop()
+                }
+            }
+        }
+    }
+
+    private fun hexBytes(s: String): ByteArray {
+        val len = s.length
+        val out = ByteArray(len / 2)
+        for (i in 0 until len step 2) {
+            out[i / 2] = ((Character.digit(s[i], 16) shl 4) + Character.digit(s[i + 1], 16)).toByte()
+        }
+        return out
+    }
+
     @Synchronized
     private fun finalize(t: Task, fromWorker: Boolean) {
         if (t.status == Status.COMPLETED) return
@@ -513,7 +751,7 @@ object DownloadEngine {
         try {
             val active = synchronized(tasks) { tasks.filter { it.status == Status.RUNNING } }
             for (t in active) {
-                val now = t.parts.sumOf { it.downloaded }
+                val now = if (t.hls != null) t.downloaded else t.parts.sumOf { it.downloaded }
                 t.downloaded = now
                 t.speed = ((now - t.lastTickBytes) * 2)  // bytes/sec (tick = 500ms)
                 t.lastTickBytes = now
@@ -554,6 +792,14 @@ object DownloadEngine {
                         .put("threads", t.threads).put("status", t.status.name)
                         .put("error", t.error ?: "")
                         .put("added", t.addedAt).put("finished", t.finishedAt)
+                        .put("hls", t.hls != null)
+                        .apply {
+                            t.hls?.let {
+                                put("hlsVariant", it.variantUrl)
+                                put("segDone", it.segDone)
+                                put("segTotal", it.segTotal)
+                            }
+                        }
                         .put("parts", parts))
                 }
             }
@@ -582,6 +828,13 @@ object DownloadEngine {
                 t.error = o.optString("error", "").takeIf { it.isNotBlank() }
                 t.addedAt = o.optLong("added", System.currentTimeMillis())
                 t.finishedAt = o.optLong("finished", 0)
+                if (o.optBoolean("hls", false)) {
+                    t.hls = HlsInfo(
+                        variantUrl = o.optString("hlsVariant", ""),
+                        segDone = o.optInt("segDone", 0),
+                        segTotal = o.optInt("segTotal", 0)
+                    )
+                }
                 val ps = o.optJSONArray("parts") ?: JSONArray()
                 for (j in 0 until ps.length()) {
                     val po = ps.getJSONObject(j)
