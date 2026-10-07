@@ -48,6 +48,8 @@ object AdBlocker {
     private val io = Executors.newSingleThreadExecutor()
     private val history = mutableListOf<BlockedEntry>()
     private val totalBlocked = AtomicLong(0)
+    private val todayBlocked = AtomicLong(0)
+    @Volatile private var todayKey = ""
     private lateinit var prefs: android.content.SharedPreferences
     private val listeners = java.util.concurrent.CopyOnWriteArrayList<(MutableList<BlockedEntry>) -> Unit>()
 
@@ -161,6 +163,9 @@ object AdBlocker {
         loadBlocklist()
         enabled = prefs.getBoolean("enabled", true)
         totalBlocked.set(prefs.getLong("total", 0L))
+        todayKey = prefs.getString("todayKey", "") ?: ""
+        todayBlocked.set(prefs.getLong("today", 0L))
+        rollDay()
         try {
             val a = JSONArray(prefs.getString("history", "[]"))
             for (i in 0 until a.length()) {
@@ -645,7 +650,9 @@ try{
                 history.add(0, BlockedEntry(rule, url, System.currentTimeMillis()))
                 if (history.size > 500) while (history.size > 500) history.removeAt(history.size - 1)
             }
+            rollDay()
             totalBlocked.incrementAndGet()
+            todayBlocked.incrementAndGet()
             persistAsync()
             notifyListeners()
         }
@@ -662,6 +669,17 @@ try{
     }
 
     fun total(): Long = totalBlocked.get()
+
+    /** Blocked today - independent of the 500-entry history list. */
+    fun today(): Long { rollDay(); return todayBlocked.get() }
+
+    private fun dayKey(): String =
+        java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.US).format(java.util.Date())
+
+    @Synchronized private fun rollDay() {
+        val k = dayKey()
+        if (k != todayKey) { todayKey = k; todayBlocked.set(0) }
+    }
 
     fun snapshot(): MutableList<BlockedEntry> = synchronized(history) { history.toMutableList() }
 
@@ -691,6 +709,8 @@ try{
         prefs.edit()
             .putString("history", a.toString())
             .putLong("total", totalBlocked.get())
+            .putLong("today", todayBlocked.get())
+            .putString("todayKey", todayKey)
             .apply()
     }
 }

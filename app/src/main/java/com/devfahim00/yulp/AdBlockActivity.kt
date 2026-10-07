@@ -92,12 +92,8 @@ class AdBlockActivity : AppCompatActivity() {
     }
 
     private fun updateStats() {
-        val today = SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(Date())
-        val todayCount = entries.count {
-            SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(Date(it.time)) == today
-        }
         findViewById<TextView>(R.id.statTotal).text = formatNumber(AdBlocker.total())
-        findViewById<TextView>(R.id.statToday).text = formatNumber(todayCount.toLong())
+        findViewById<TextView>(R.id.statToday).text = formatNumber(AdBlocker.today())
         findViewById<TextView>(R.id.blockedDesc).text = if (AdBlocker.enabled)
             "Blocking ads and trackers on every page you visit"
         else "Ad blocker is off — ads and trackers are loading normally"

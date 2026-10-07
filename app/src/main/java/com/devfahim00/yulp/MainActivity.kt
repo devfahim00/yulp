@@ -198,6 +198,17 @@ class MainActivity : AppCompatActivity() {
                 go(v.text.toString()); true
             } else false
         }
+        val clearBtn = findViewById<View>(R.id.btnClearUrl)
+        val updateClear = { clearBtn.visibility =
+            if (urlBar.hasFocus() && !urlBar.text.isNullOrEmpty()) View.VISIBLE else View.GONE }
+        urlBar.doAfterTextChanged { updateClear() }
+        urlBar.setOnFocusChangeListener { _, _ -> updateClear() }
+        clearBtn.setOnClickListener {
+            urlBar.setText("")
+            urlBar.requestFocus()
+            (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
+                .showSoftInput(urlBar, 0)
+        }
         findViewById<View>(R.id.btnReload).setOnClickListener { current?.web?.reload() }
         findViewById<View>(R.id.btnBack).setOnClickListener { current?.web?.let { if (it.canGoBack()) it.goBack() } }
         findViewById<View>(R.id.btnForward).setOnClickListener { current?.web?.let { if (it.canGoForward()) it.goForward() } }
@@ -255,6 +266,7 @@ class MainActivity : AppCompatActivity() {
         }
         if (tabs.isEmpty()) return false
         switchTo(if (savedCur in tabs.indices) savedCur else firstIndex)
+        container.post { ensureContent() }
         return true
     }
 
@@ -270,8 +282,26 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onPause() { captureThumb(current); current?.web?.onPause(); super.onPause() }
-    override fun onResume() { super.onResume(); current?.web?.onResume() }
-    override fun onDestroy() { tabs.forEach { it.web.destroy() }; super.onDestroy() }
+    override fun onResume() {
+        super.onResume()
+        current?.web?.onResume()
+        container.postDelayed({ ensureContent() }, 400)
+    }
+
+    override fun onDestroy() {
+        // detach first: destroying a WebView that is still attached can leave the
+        // re-created activity (theme change) with a blank page
+        container.removeAllViews()
+        tabs.forEach { it.web.destroy() }
+        super.onDestroy()
+    }
+
+    /** Safety net: a tab that ended up with no document (e.g. after a theme re-create) shows the start page. */
+    private fun ensureContent() {
+        val t = current ?: return
+        val u = t.web.url
+        if (u.isNullOrBlank() || u == "about:blank") loadHome(t.web)
+    }
 
     // ---------- tabs ----------
 
@@ -349,6 +379,12 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
     private fun makeWebView(t: Tab): WebView {
         val w = WebView(this)
+        // theme-matched backdrop so a not-yet-rendered page is never a white void in dark mode
+        w.setBackgroundColor(
+            com.google.android.material.color.MaterialColors.getColor(
+                this, com.google.android.material.R.attr.colorSurface, Color.WHITE
+            )
+        )
         w.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true

@@ -40,10 +40,10 @@ object MenuSheet {
 
         // drag handle
         val handle = View(activity).apply {
-            layoutParams = LinearLayout.LayoutParams(40 * dp.toInt(), 4 * dp.toInt()).apply {
+            layoutParams = LinearLayout.LayoutParams((40 * dp).toInt(), (4 * dp).toInt()).apply {
                 gravity = Gravity.CENTER_HORIZONTAL
-                topMargin = 10 * dp.toInt()
-                bottomMargin = 6 * dp.toInt()
+                topMargin = (10 * dp).toInt()
+                bottomMargin = (6 * dp).toInt()
             }
             setBackgroundResource(R.drawable.bg_handle)
         }
@@ -51,8 +51,8 @@ object MenuSheet {
 
         // pager with the two grid pages - height sized EXACTLY to the row count
         // (rows x rowHeight + padding) so there is no dead space below the grid.
-        val rowH = 84 * dp.toInt()
-        val pagePad = 8 * dp.toInt()
+        val rowH = (84 * dp).toInt()
+        val pagePad = (8 * dp).toInt()
         val rows = ((maxOf(page1.size, page2.size) + 4) / 5).coerceAtLeast(1)
         val gridH = rows * rowH + 2 * pagePad
         val pager = ViewPager2(activity).apply {
@@ -75,7 +75,7 @@ object MenuSheet {
         val footer = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(20 * dp.toInt(), 4 * dp.toInt(), 20 * dp.toInt(), 12 * dp.toInt())
+            setPadding((20 * dp).toInt(), (4 * dp).toInt(), (20 * dp).toInt(), (12 * dp).toInt())
             layoutParams = LinearLayout.LayoutParams(-1, -2)
         }
         val power = makeFooterBtn(activity, R.drawable.ic_power, "Exit") { sheet.dismiss(); onExit() }
@@ -83,15 +83,15 @@ object MenuSheet {
         val dots = LinearLayout(activity).apply { gravity = Gravity.CENTER_HORIZONTAL }
         val dotViews = (0 until pages.size).map { i ->
             View(activity).apply {
-                layoutParams = LinearLayout.LayoutParams(8 * dp.toInt(), 8 * dp.toInt()).apply {
-                    marginEnd = 6 * dp.toInt()
+                layoutParams = LinearLayout.LayoutParams((8 * dp).toInt(), (8 * dp).toInt()).apply {
+                    marginEnd = (6 * dp).toInt()
                 }
                 setBackgroundResource(R.drawable.bg_dot)
                 alpha = if (i == 0) 1f else 0.3f
             }
         }
         dotViews.forEach { dots.addView(it) }
-        footer.addView(dots, LinearLayout.LayoutParams(0, 48 * dp.toInt(), 1.2f).apply { gravity = Gravity.CENTER })
+        footer.addView(dots, LinearLayout.LayoutParams(0, (48 * dp).toInt(), 1.2f).apply { gravity = Gravity.CENTER })
         val down = makeFooterBtn(activity, R.drawable.ic_chevron_down, "Close") { sheet.dismiss() }
         footer.addView(down, LinearLayout.LayoutParams(0, -2, 1f).apply { gravity = Gravity.END })
         root.addView(footer)
@@ -103,6 +103,13 @@ object MenuSheet {
         })
 
         sheet.setContentView(root)
+        sheet.behavior.skipCollapsed = true
+        sheet.behavior.state = com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED
+        sheet.setOnShowListener {
+            sheet.findViewById<View>(com.google.android.material.R.id.design_bottom_sheet)
+                ?.setBackgroundColor(android.graphics.Color.TRANSPARENT)
+            sheet.behavior.state = com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED
+        }
         sheet.show()
         return sheet
     }
@@ -145,8 +152,8 @@ object MenuSheet {
                     columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
                     rowSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
                     width = 0
-                    height = rowH
-                    setMargins(2, 4, 2, 4)
+                    height = rowH - (8 * dp).toInt()
+                    setMargins((2 * dp).toInt(), (4 * dp).toInt(), (2 * dp).toInt(), (4 * dp).toInt())
                 }
             }
             val icon = ImageView(ctx).apply {
