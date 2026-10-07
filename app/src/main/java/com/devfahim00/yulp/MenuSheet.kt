@@ -51,7 +51,7 @@ object MenuSheet {
 
         // pager with the two grid pages
         val pager = ViewPager2(activity).apply {
-            layoutParams = LinearLayout.LayoutParams(-1, 190 * dp.toInt())
+            layoutParams = LinearLayout.LayoutParams(-1, 210 * dp.toInt())
         }
         val pages = listOf(page1, page2)
         pager.adapter = object : androidx.recyclerview.widget.RecyclerView.Adapter<androidx.recyclerview.widget.RecyclerView.ViewHolder>() {
@@ -150,8 +150,9 @@ object MenuSheet {
             }
             val label = TextView(ctx).apply {
                 text = it.label
-                textSize = 11f
+                textSize = 10.5f
                 gravity = Gravity.CENTER
+                maxLines = 2
                 setTextColor(ctx.getColor(R.color.menuItemText))
                 layoutParams = LinearLayout.LayoutParams(-2, -2).apply {
                     topMargin = (6 * dp).toInt()
