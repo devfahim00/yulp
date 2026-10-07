@@ -1,17 +1,19 @@
 package com.devfahim00.yulp
 
+import android.Manifest
 import android.annotation.SuppressLint
-import android.app.DownloadManager
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
-import android.os.Environment
 import android.view.KeyEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
@@ -22,12 +24,14 @@ import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebStorage
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageButton
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
@@ -35,16 +39,19 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.PopupMenu
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.widget.doAfterTextChanged
 import androidx.webkit.WebSettingsCompat
 import androidx.webkit.WebViewFeature
+import com.google.android.material.button.MaterialButton
+import com.google.android.material.button.MaterialButtonToggleGroup
 import com.google.android.material.progressindicator.LinearProgressIndicator
 
 class MainActivity : AppCompatActivity() {
 
-    private class Tab(val incognito: Boolean) {
+    private class Tab(val id: Int, val incognito: Boolean) {
         lateinit var web: WebView
         var title = "New tab"
         var desktop = false
@@ -52,6 +59,7 @@ class MainActivity : AppCompatActivity() {
 
     private companion object {
         const val HOME = "https://yulp.start/"
+        var nextId = 1
     }
 
     private val tabs = mutableListOf<Tab>()
@@ -65,6 +73,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tabCount: TextView
     private lateinit var findBar: View
     private lateinit var findInput: EditText
+    private lateinit var incognitoIcon: ImageButton
     private lateinit var mobileUa: String
 
     private var customView: View? = null
@@ -79,10 +88,67 @@ class MainActivity : AppCompatActivity() {
             filePathCb = null
         }
 
+    private val tabLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
+            if (res.resultCode != RESULT_OK) return@registerForActivityResult
+            val data = res.data ?: return@registerForActivityResult
+            val closed = data.getIntArrayExtra("closedIds") ?: IntArray(0)
+            val action = data.getStringExtra("action")
+
+            if (action == "closeAll") {
+                tabs.forEach { container.removeView(it.web); it.web.destroy() }
+                tabs.clear()
+                cur = -1
+                Tabs.thumbnails.clear()
+                newTab()
+                return@registerForActivityResult
+            }
+            if (closed.isNotEmpty()) {
+                container.removeAllViews()
+                closed.forEach { id ->
+                    val i = tabs.indexOfFirst { it.id == id }
+                    if (i >= 0) {
+                        val t = tabs.removeAt(i)
+                        t.web.destroy()
+                        Tabs.thumbnails.remove(id)
+                    }
+                }
+                cur = -1
+            }
+            when (action) {
+                "new" -> newTab()
+                "newIncognito" -> newTab(null, true)
+                else -> {
+                    val sel = data.getIntExtra("selectId", -1)
+                    val idx = if (sel >= 0) tabs.indexOfFirst { it.id == sel } else -1
+                    when {
+                        idx >= 0 -> switchTo(idx)
+                        tabs.isEmpty() -> newTab()
+                        else -> switchTo(0)
+                    }
+                }
+            }
+            updateTabSnapshot()
+        }
+
+    private val listLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
+            val url = res.data?.getStringExtra("url")
+            if (!url.isNullOrBlank()) {
+                if (res.data?.getBooleanExtra("newTab", false) == true) newTab(url)
+                else current?.web?.loadUrl(url)
+            }
+        }
+
+    private val notifPerm =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
         store = Store(this)
+        AdBlocker.init(this)
+        DownloadEngine.init(this, autoResume = false)
         mobileUa = WebSettings.getDefaultUserAgent(this)
 
         container = findViewById(R.id.container)
@@ -91,6 +157,7 @@ class MainActivity : AppCompatActivity() {
         tabCount = findViewById(R.id.tabCount)
         findBar = findViewById(R.id.findBar)
         findInput = findViewById(R.id.findInput)
+        incognitoIcon = findViewById(R.id.icIncognito)
 
         urlBar.setOnEditorActionListener { v, actionId, e ->
             if (actionId == EditorInfo.IME_ACTION_GO || e?.keyCode == KeyEvent.KEYCODE_ENTER) {
@@ -101,7 +168,7 @@ class MainActivity : AppCompatActivity() {
         findViewById<View>(R.id.btnBack).setOnClickListener { current?.web?.let { if (it.canGoBack()) it.goBack() } }
         findViewById<View>(R.id.btnForward).setOnClickListener { current?.web?.let { if (it.canGoForward()) it.goForward() } }
         findViewById<View>(R.id.btnHome).setOnClickListener { current?.web?.let { loadHome(it) } }
-        findViewById<View>(R.id.btnTabs).setOnClickListener { showTabs() }
+        findViewById<View>(R.id.btnTabs).setOnClickListener { openTabGrid() }
         findViewById<View>(R.id.btnMenu).setOnClickListener { showMenu(it) }
 
         findInput.doAfterTextChanged { current?.web?.findAllAsync(it.toString()) }
@@ -129,14 +196,14 @@ class MainActivity : AppCompatActivity() {
         intent.data?.let { newTab(it.toString()) }
     }
 
-    override fun onPause() { current?.web?.onPause(); super.onPause() }
+    override fun onPause() { captureThumb(current); current?.web?.onPause(); super.onPause() }
     override fun onResume() { super.onResume(); current?.web?.onResume() }
     override fun onDestroy() { tabs.forEach { it.web.destroy() }; super.onDestroy() }
 
     // ---------- tabs ----------
 
     private fun newTab(url: String? = null, incognito: Boolean = false) {
-        val t = Tab(incognito)
+        val t = Tab(nextId++, incognito)
         t.web = makeWebView(t)
         tabs.add(t)
         switchTo(tabs.lastIndex)
@@ -145,6 +212,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun switchTo(i: Int) {
         closeFind()
+        captureThumb(current)
         tabs.getOrNull(cur)?.web?.onPause()
         container.removeAllViews()
         cur = i
@@ -155,27 +223,51 @@ class MainActivity : AppCompatActivity() {
         urlBar.hint = if (t.incognito) "Incognito · search or type URL" else "Search or type URL"
         showUrl(t.web.url ?: "")
         progress.visibility = View.INVISIBLE
+        updateIncognitoBadge()
+        updateTabSnapshot()
+    }
+
+    private fun updateIncognitoBadge() {
+        val t = current
+        incognitoIcon.visibility = if (t?.incognito == true) View.VISIBLE else View.GONE
+    }
+
+    private fun updateTabSnapshot() {
+        Tabs.snapshot = tabs.map {
+            Tabs.TabInfo(it.id, it.title.ifBlank { "New tab" }, it.web.url ?: "", it.incognito)
+        }
+        Tabs.currentId = current?.id ?: -1
+    }
+
+    private fun captureThumb(t: Tab?) {
+        t ?: return
+        try {
+            val w = t.web
+            if (w.width <= 0 || w.height <= 0) return
+            val tw = 320
+            val th = (tw.toLong() * w.height / w.width).toInt().coerceAtLeast(1)
+            val bmp = Bitmap.createBitmap(tw, th, Bitmap.Config.RGB_565)
+            val c = Canvas(bmp)
+            c.scale(tw.toFloat() / w.width, th.toFloat() / w.height)
+            w.draw(c)
+            Tabs.putThumb(t.id, bmp)
+        } catch (_: Exception) {
+        }
     }
 
     private fun closeTab(i: Int) {
         val t = tabs.removeAt(i)
+        Tabs.thumbnails.remove(t.id)
         container.removeView(t.web)
         t.web.destroy()
         cur = -1
         if (tabs.isEmpty()) newTab() else switchTo(minOf(i, tabs.lastIndex))
     }
 
-    private fun showTabs() {
-        val names = tabs.mapIndexed { i, t ->
-            (if (i == cur) "● " else "") + (if (t.incognito) "🕶 " else "") + t.title.ifBlank { "New tab" }
-        }.toTypedArray()
-        AlertDialog.Builder(this)
-            .setTitle("Tabs (${tabs.size})")
-            .setItems(names) { _, i -> switchTo(i) }
-            .setPositiveButton("New tab") { _, _ -> newTab() }
-            .setNegativeButton("Incognito") { _, _ -> newTab(null, true) }
-            .setNeutralButton("Close tab") { _, _ -> closeTab(cur) }
-            .show()
+    private fun openTabGrid() {
+        captureThumb(current)
+        updateTabSnapshot()
+        tabLauncher.launch(Intent(this, TabActivity::class.java))
     }
 
     // ---------- webview ----------
@@ -207,12 +299,13 @@ class MainActivity : AppCompatActivity() {
             when (r.type) {
                 WebView.HitTestResult.SRC_ANCHOR_TYPE ->
                     AlertDialog.Builder(this).setTitle(x)
-                        .setItems(arrayOf("Open in new tab", "Open in incognito", "Copy link", "Share link")) { _, i ->
+                        .setItems(arrayOf("Open in new tab", "Open in incognito", "Copy link", "Share link", "Download link")) { _, i ->
                             when (i) {
                                 0 -> newTab(x)
                                 1 -> newTab(x, true)
                                 2 -> copy(x)
-                                else -> share(x)
+                                3 -> share(x)
+                                else -> download(x, null, null, null)
                             }
                         }.show()
                 WebView.HitTestResult.IMAGE_TYPE ->
@@ -226,16 +319,34 @@ class MainActivity : AppCompatActivity() {
         }
 
         w.webViewClient = object : WebViewClient() {
+
+            override fun shouldInterceptRequest(view: WebView, r: WebResourceRequest): WebResourceResponse? {
+                if (r.isForMainFrame) return null
+                val u = r.url.toString()
+                val rule = AdBlocker.blocked(u)
+                if (rule != null) {
+                    // ads are blocked in incognito too, but nothing is recorded
+                    if (!t.incognito) AdBlocker.record(u, rule)
+                    return AdBlocker.emptyResponse()
+                }
+                return null
+            }
+
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
                 if (t === current) { showUrl(url); progress.visibility = View.VISIBLE }
             }
 
             override fun onPageFinished(view: WebView, url: String) {
                 t.title = view.title ?: url
-                if (t === current) { showUrl(url); progress.visibility = View.INVISIBLE }
+                if (t === current) {
+                    showUrl(url)
+                    progress.visibility = View.INVISIBLE
+                    captureThumb(t)
+                }
                 if (!t.incognito && url.startsWith("http") && !isHome(url)) {
                     store.addHistory(Store.Item(t.title, url))
                 }
+                updateTabSnapshot()
             }
 
             override fun shouldOverrideUrlLoading(view: WebView, r: WebResourceRequest): Boolean {
@@ -268,7 +379,10 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            override fun onReceivedTitle(view: WebView, title: String?) { t.title = title ?: "" }
+            override fun onReceivedTitle(view: WebView, title: String?) {
+                t.title = title ?: ""
+                if (t === current) updateTabSnapshot()
+            }
 
             override fun onShowCustomView(view: View, cb: WebChromeClient.CustomViewCallback) = showCustom(view, cb)
             override fun onHideCustomView() = hideCustom()
@@ -374,7 +488,8 @@ class MainActivity : AppCompatActivity() {
             add(0, 5, 0, "Bookmarks")
             add(0, 6, 0, "History")
             add(0, 7, 0, "Downloads")
-            add(0, 8, 0, "Find in page")
+            add(0, 8, 0, "Ad blocker")
+            add(0, 12, 0, "Find in page")
             add(0, 9, 0, "Desktop site").apply { isCheckable = true; isChecked = t.desktop }
             add(0, 10, 0, "Share")
             add(0, 11, 0, "Clear browsing data")
@@ -387,10 +502,11 @@ class MainActivity : AppCompatActivity() {
                 4 -> if (url.startsWith("http") && !isHome(url))
                     toast(if (store.toggleBookmark(Store.Item(t.title, url))) "Bookmarked" else "Bookmark removed")
                 else toast("Open a page first")
-                5 -> showList("Bookmarks", "b")
-                6 -> showList("History", "h")
-                7 -> startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS))
-                8 -> openFind()
+                5 -> listLauncher.launch(Intent(this, ListPageActivity::class.java).putExtra("mode", "bookmarks"))
+                6 -> listLauncher.launch(Intent(this, ListPageActivity::class.java).putExtra("mode", "history"))
+                7 -> startActivity(Intent(this, DownloadsActivity::class.java))
+                8 -> startActivity(Intent(this, AdBlockActivity::class.java))
+                12 -> openFind()
                 9 -> setDesktop(t, !t.desktop)
                 10 -> if (url.startsWith("http")) share(url) else toast("Nothing to share")
                 11 -> clearData()
@@ -398,17 +514,6 @@ class MainActivity : AppCompatActivity() {
             true
         }
         m.show()
-    }
-
-    private fun showList(title: String, key: String) {
-        val l = store.get(key)
-        if (l.isEmpty()) { toast("Nothing here yet"); return }
-        val labels = l.map { it.title.ifBlank { it.url } + "\n" + it.url }.toTypedArray()
-        AlertDialog.Builder(this).setTitle(title)
-            .setItems(labels) { _, i -> current?.web?.loadUrl(l[i].url) }
-            .setNegativeButton("Clear all") { _, _ -> store.clear(key); toast("Cleared") }
-            .setPositiveButton("Close", null)
-            .show()
     }
 
     private fun setDesktop(t: Tab, on: Boolean) {
@@ -431,23 +536,54 @@ class MainActivity : AppCompatActivity() {
         toast("History, cookies and cache cleared")
     }
 
-    // ---------- downloads ----------
+    // ---------- downloads (built-in multi-thread engine) ----------
 
     private fun download(url: String, ua: String?, cd: String?, mime: String?) {
-        try {
-            val name = URLUtil.guessFileName(url, cd, mime)
-            val req = DownloadManager.Request(Uri.parse(url)).apply {
-                mime?.let { setMimeType(it) }
-                ua?.let { addRequestHeader("User-Agent", it) }
-                CookieManager.getInstance().getCookie(url)?.let { addRequestHeader("Cookie", it) }
-                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name)
-            }
-            (getSystemService(DOWNLOAD_SERVICE) as DownloadManager).enqueue(req)
-            toast("Downloading $name")
-        } catch (e: Exception) {
-            toast("Download failed")
+        if (!url.startsWith("http")) { toast("Cannot download this link"); return }
+        val guessed = try { URLUtil.guessFileName(url, cd, mime) } catch (_: Exception) { "download" }
+        val headers = buildMap {
+            ua?.takeIf { it.isNotBlank() }?.let { put("User-Agent", it) }
+            try {
+                CookieManager.getInstance().getCookie(url)?.let { if (it.isNotBlank()) put("Cookie", it) }
+            } catch (_: Exception) {}
+            current?.web?.url?.takeIf { it.startsWith("http") }?.let { put("Referer", it) }
         }
+        showDownloadDialog(url, guessed, mime, headers)
+    }
+
+    private fun showDownloadDialog(
+        url: String, name: String, mime: String?, headers: Map<String, String>
+    ) {
+        val view = layoutInflater.inflate(R.layout.dialog_download, null)
+        val nameInput = view.findViewById<EditText>(R.id.dlName)
+        nameInput.setText(name)
+        val group = view.findViewById<MaterialButtonToggleGroup>(R.id.dlThreads)
+        val btns = DownloadEngine.THREAD_OPTIONS.map { n ->
+            group.getChildAt(DownloadEngine.THREAD_OPTIONS.indexOf(n)) as MaterialButton
+        }
+        val sel = DownloadEngine.THREAD_OPTIONS.indexOf(DownloadEngine.defaultThreads)
+            .let { if (it >= 0) it else DownloadEngine.THREAD_OPTIONS.indexOf(4) }
+        btns.getOrNull(sel)?.isChecked = true
+
+        val dlg = AlertDialog.Builder(this)
+            .setTitle("Download file")
+            .setView(view)
+            .setPositiveButton("Download") { _, _ ->
+                val finalName = nameInput.text.toString().ifBlank { name }
+                var threads = DownloadEngine.defaultThreads
+                for (i in btns.indices) if (btns[i].isChecked) threads = DownloadEngine.THREAD_OPTIONS[i]
+                if (Build.VERSION.SDK_INT >= 33 &&
+                    ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                    != PackageManager.PERMISSION_GRANTED
+                ) notifPerm.launch(Manifest.permission.POST_NOTIFICATIONS)
+                DownloadEngine.init(this, false)
+                    .enqueue(url, finalName, mime, headers, threads)
+                toast("Downloading $finalName · $threads thread" + if (threads > 1) "s" else "")
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+        dlg.window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
+        dlg.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE)
     }
 
     // ---------- built-in pages ----------

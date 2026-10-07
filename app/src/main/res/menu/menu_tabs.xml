@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+    <item
+        android:id="@+id/actNew"
+        android:icon="@drawable/ic_add"
+        android:title="New tab"
+        app:showAsAction="ifRoom" />
+    <item
+        android:id="@+id/actNewIncognito"
+        android:icon="@drawable/ic_incognito"
+        android:title="New incognito tab"
+        app:showAsAction="ifRoom" />
+    <item
+        android:id="@+id/actCloseAll"
+        android:title="Close all tabs"
+        app:showAsAction="never" />
+</menu>

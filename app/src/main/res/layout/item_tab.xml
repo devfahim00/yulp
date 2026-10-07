@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/card"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:layout_margin="6dp"
+    android:background="@drawable/bg_tab_card"
+    android:orientation="vertical"
+    android:padding="8dp">
+
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content">
+
+        <ImageView
+            android:id="@+id/thumb"
+            android:layout_width="match_parent"
+            android:layout_height="180dp"
+            android:background="?attr/colorSurfaceContainerHigh"
+            android:contentDescription="Tab thumbnail"
+            android:scaleType="centerCrop" />
+
+        <ImageView
+            android:id="@+id/incognitoBadge"
+            android:layout_width="26dp"
+            android:layout_height="26dp"
+            android:layout_gravity="start|top"
+            android:layout_margin="6dp"
+            android:background="#AA000000"
+            android:contentDescription="Incognito tab"
+            android:padding="4dp"
+            android:src="@drawable/ic_incognito"
+            app:tint="#FFFFFF" />
+
+        <ImageButton
+            android:id="@+id/close"
+            style="@style/NavBtn"
+            android:layout_width="26dp"
+            android:layout_height="26dp"
+            android:layout_gravity="end|top"
+            android:layout_margin="6dp"
+            android:background="#AA000000"
+            android:contentDescription="Close tab"
+            android:padding="4dp"
+            android:scaleType="centerInside"
+            android:src="@drawable/ic_close"
+            app:tint="#FFFFFF" />
+    </FrameLayout>
+
+    <TextView
+        android:id="@+id/title"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:ellipsize="end"
+        android:paddingTop="8dp"
+        android:singleLine="true"
+        android:text="New tab"
+        android:textColor="?attr/colorOnSurface"
+        android:textSize="13sp"
+        android:textStyle="bold" />
+</LinearLayout>

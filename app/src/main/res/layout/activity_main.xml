@@ -32,6 +32,17 @@
             android:textSize="15sp" />
 
         <ImageButton
+            android:id="@+id/icIncognito"
+            style="@style/NavBtn"
+            android:layout_width="34dp"
+            android:layout_height="46dp"
+            android:contentDescription="Incognito"
+            android:scaleType="centerInside"
+            android:src="@drawable/ic_incognito"
+            android:visibility="gone"
+            app:tint="?attr/colorPrimary" />
+
+        <ImageButton
             android:id="@+id/btnReload"
             style="@style/NavBtn"
             android:layout_width="46dp"
